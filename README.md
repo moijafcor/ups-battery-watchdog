@@ -142,6 +142,45 @@ ExecStart=/usr/bin/python3 /opt/ups-battery-watchdog/ups_battery_watchdog.py --h
 
 Make sure the remote host's NIS is listening on `0.0.0.0` (not `127.0.0.1`) and that port 3551 is reachable.
 
+### Choosing a shutdown delay
+
+The `--delay` value (default: `1` minute) is a grace period between the watchdog
+detecting battery operation and the host halting. It should be short enough that
+the host shuts down cleanly **before the battery is exhausted**, but long enough
+for in-flight workloads (database flushes, NFS syncs, etc.) to finish.
+
+**General formula:**
+
+```
+safe delay = estimated runtime − shutdown overhead − safety margin
+```
+
+Where:
+- **Estimated runtime** — the `TIMELEFT` value reported by apcupsd under your
+  typical load. Check it with `apcaccess status`.
+- **Shutdown overhead** — time the OS takes to stop services, unmount filesystems,
+  and power off. Usually 15–60 seconds; check with `systemd-analyze`.
+- **Safety margin** — buffer for battery degradation and load spikes.
+  At least 30–60 seconds is recommended.
+
+**Example:** A UPS reporting `TIMELEFT: 2.8 Minutes` under normal load, with a
+~30 s shutdown overhead and a 60 s margin, leaves roughly 1 minute for the delay:
+
+```bash
+python3 ups_battery_watchdog.py --delay 1
+```
+
+**Heavily loaded servers or degraded batteries** may have a `TIMELEFT` of only
+1–2 minutes. In those cases use `--delay 0` for an immediate shutdown, and
+prioritise replacing the battery.
+
+> **Note:** `TIMELEFT` is an estimate calculated by the UPS from current load and
+> battery voltage. It can drop faster than expected when load spikes. Always
+> leave a margin, and validate periodically by checking `TIMELEFT` under peak load:
+> ```bash
+> watch -n 10 apcaccess status
+> ```
+
 ### Log file permissions
 
 The default log path is `/var/log/ups-battery-watchdog.log`. When running as
@@ -164,7 +203,7 @@ usage: ups_battery_watchdog.py [-h] [--host HOST] [--port PORT] [--delay MINUTES
 
   --host HOST      apcupsd NIS host (default: localhost)
   --port PORT      apcupsd NIS port (default: 3551)
-  --delay MINUTES  minutes to wait before shutdown (default: 1)
+  --delay MINUTES  minutes to wait before shutdown (default: 1; see Choosing a shutdown delay)
   --log-file PATH  log file path (default: /var/log/ups-battery-watchdog.log)
   --dry-run        log what would happen without executing shutdown
 
