@@ -112,12 +112,17 @@ Make sure the remote host's NIS is listening on `0.0.0.0` (not `127.0.0.1`) and 
 ## CLI options
 
 ```
-usage: ups_battery_watchdog.py [-h] [--host HOST] [--port PORT] [--delay MINUTES] [--dry-run]
+usage: ups_battery_watchdog.py [-h] [--host HOST] [--port PORT] [--delay MINUTES]
+                                [--log-file PATH] [--dry-run] [{outages}]
 
   --host HOST      apcupsd NIS host (default: localhost)
   --port PORT      apcupsd NIS port (default: 3551)
   --delay MINUTES  minutes to wait before shutdown (default: 1)
+  --log-file PATH  log file path (default: /var/log/ups-battery-watchdog.log)
   --dry-run        log what would happen without executing shutdown
+
+Subcommands:
+  outages          print outage history from the log file
 ```
 
 ## Testing
@@ -139,6 +144,34 @@ Example output (UPS on battery):
 2026-04-03T10:00:01 INFO UPS status=ONBATT load=31.0 Percent battery=97.0 Percent runtime=2.7 Minutes
 2026-04-03T10:00:01 WARNING DRY RUN — would execute: /usr/sbin/shutdown -h +1 UPS on battery: shutting down
 ```
+
+## Viewing outage history
+
+```bash
+python3 ups_battery_watchdog.py outages
+```
+
+Example output:
+
+```
+Outage events from /var/log/ups-battery-watchdog.log:
+
+Timestamp              Event        Load         Battery      Runtime
+------------------------------------------------------------------------------
+2026-04-03T22:46:00    ON BATTERY   34.0         97.0         2.6
+2026-04-03T22:46:00    SHUTDOWN     —            —            —
+2026-04-03T22:50:01    COMM LOST    —            —            —
+
+Total: 1 on-battery event(s), 1 shutdown(s), 1 comm-lost event(s)
+```
+
+Three event types are tracked:
+
+| Event | Meaning |
+|---|---|
+| `ON BATTERY` | UPS switched to battery; load/battery/runtime recorded |
+| `SHUTDOWN` | Shutdown command was issued |
+| `COMM LOST` | Could not reach apcupsd NIS |
 
 ## Checking timer status
 

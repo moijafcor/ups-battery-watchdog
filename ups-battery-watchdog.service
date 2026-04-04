@@ -10,6 +10,7 @@ ExecStart=/usr/bin/python3 /opt/ups-battery-watchdog/ups_battery_watchdog.py
 # Override examples:
 # ExecStart=/usr/bin/python3 /opt/ups-battery-watchdog/ups_battery_watchdog.py --delay 2
 # ExecStart=/usr/bin/python3 /opt/ups-battery-watchdog/ups_battery_watchdog.py --host 192.168.1.x --delay 2
+# ExecStart=/usr/bin/python3 /opt/ups-battery-watchdog/ups_battery_watchdog.py --log-file /var/log/ups-battery-watchdog.log
 
 [Install]
 WantedBy=multi-user.target
