@@ -1,14 +1,53 @@
 # apcupsd-battery-watchdog
 
-Lightweight Python daemon that monitors an APC UPS via the apcupsd Network Information Server (NIS) and initiates a graceful host shutdown when the UPS switches to battery power.
+Lightweight Python watchdog that monitors an APC UPS via the apcupsd Network
+Information Server (NIS) and initiates a graceful host shutdown when the UPS
+switches to battery power.
 
-No dependencies beyond the Python standard library. Works locally or remotely — useful for protecting machines that are powered by a UPS connected to a different host.
+No dependencies beyond the Python standard library. Works locally or remotely —
+useful for protecting machines that draw power from a UPS connected to a
+different host.
 
 ## Requirements
 
 - Python 3.9+
 - [apcupsd](https://www.apcupsd.com/) installed and running with NIS enabled (default port 3551)
 - Linux host with `/usr/sbin/shutdown`
+
+## How it works
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  systemd timer (every 2 min)                            │
+│       │                                                 │
+│       ▼                                                 │
+│  ups_battery_watchdog.py                                │
+│       │                                                 │
+│       ├─ connect to apcupsd NIS (localhost:3551)        │
+│       │       sends: [len] "status"                     │
+│       │       recvs: [len] "KEY : VALUE" × N + [0]      │
+│       │                                                 │
+│       ├─ STATUS == ONBATT?                              │
+│       │       yes ──► shutdown -h +N                    │
+│       │       no  ──► log and exit 0                    │
+│       │                                                 │
+│       └─ append structured log line to log file         │
+└─────────────────────────────────────────────────────────┘
+```
+
+Each invocation is **stateless** — it queries NIS once, logs the result, and
+exits. Persistent state lives only in the log file. The `outages` subcommand
+parses that file to reconstruct outage history across reboots.
+
+### NIS wire protocol
+
+apcupsd NIS uses a simple length-prefixed framing:
+
+1. Client sends a 2-byte big-endian length followed by the command (`status`).
+2. Server replies with N records, each prefixed by a 2-byte length.
+3. A zero-length record signals end of stream.
+
+This is the same protocol used by `apcaccess`.
 
 ## Sample UPS status
 
@@ -55,12 +94,6 @@ END APC  : 2026-04-03 22:40:14 -0400
 ```
 
 The watchdog reads the `STATUS` field. `ONLINE` means mains power; `ONBATT` triggers shutdown.
-
-## How it works
-
-The script queries the apcupsd NIS socket directly using the native length-prefixed protocol. If `STATUS` is `ONBATT`, it calls `shutdown -h +1` to give users a 1-minute grace period before the host halts.
-
-It is designed to run on a schedule (systemd timer or cron). Each invocation is stateless: it queries, decides, and exits.
 
 ## Installation
 
@@ -109,6 +142,20 @@ ExecStart=/usr/bin/python3 /opt/ups-battery-watchdog/ups_battery_watchdog.py --h
 
 Make sure the remote host's NIS is listening on `0.0.0.0` (not `127.0.0.1`) and that port 3551 is reachable.
 
+### Log file permissions
+
+The default log path is `/var/log/ups-battery-watchdog.log`. When running as
+root (the default for a systemd service), this is created automatically.
+
+To run as a non-root user, pre-create the file with appropriate permissions:
+
+```bash
+sudo touch /var/log/ups-battery-watchdog.log
+sudo chown myuser /var/log/ups-battery-watchdog.log
+```
+
+Or redirect to a user-writable path via `--log-file`.
+
 ## CLI options
 
 ```
@@ -145,6 +192,12 @@ Example output (UPS on battery):
 2026-04-03T10:00:01 WARNING DRY RUN — would execute: /usr/sbin/shutdown -h +1 UPS on battery: shutting down
 ```
 
+### Unit tests
+
+```bash
+python3 -m pytest test_ups_battery_watchdog.py -v
+```
+
 ## Viewing outage history
 
 ```bash
@@ -179,6 +232,21 @@ Three event types are tracked:
 systemctl list-timers ups-battery-watchdog.timer
 journalctl -u ups-battery-watchdog.service -f
 ```
+
+## Troubleshooting
+
+**`STATUS: COMMLOST` in apcaccess output**
+apcupsd is running but cannot communicate with the UPS device. Check that the
+USB cable is connected and that the kernel's HID driver hasn't claimed the device.
+Restarting apcupsd usually resolves it: `sudo systemctl restart apcupsd`.
+
+**`Cannot reach apcupsd NIS`**
+apcupsd is not running, or `NETSERVER` is off, or `NISIP` is `127.0.0.1` and
+you're connecting remotely. Verify with: `apcaccess status`.
+
+**`Cannot open log file`**
+The process doesn't have write permission to the log file or its parent directory.
+See [Log file permissions](#log-file-permissions) above.
 
 ## Exit codes
 
