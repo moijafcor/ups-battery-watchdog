@@ -10,6 +10,52 @@ No dependencies beyond the Python standard library. Works locally or remotely â€
 - [apcupsd](https://www.apcupsd.com/) installed and running with NIS enabled (default port 3551)
 - Linux host with `/usr/sbin/shutdown`
 
+## Sample UPS status
+
+Output from a live APC Back-UPS XS 1500M via `apcaccess status`:
+
+```
+APC      : 001,036,0865
+DATE     : 2026-04-03 22:40:11 -0400
+HOSTNAME : myhost
+VERSION  : 3.14.14 (31 May 2016) debian
+UPSNAME  : myups
+CABLE    : USB Cable
+DRIVER   : USB UPS Driver
+UPSMODE  : Stand Alone
+STARTTIME: 2026-04-03 18:06:20 -0400
+MODEL    : Back-UPS XS 1500M
+STATUS   : ONLINE
+LINEV    : 124.0 Volts
+LOADPCT  : 32.0 Percent
+BCHARGE  : 100.0 Percent
+TIMELEFT : 2.8 Minutes
+MBATTCHG : 5 Percent
+MINTIMEL : 3 Minutes
+MAXTIME  : 0 Seconds
+SENSE    : Medium
+LOTRANS  : 88.0 Volts
+HITRANS  : 139.0 Volts
+ALARMDEL : No alarm
+BATTV    : 27.3 Volts
+LASTXFER : Low line voltage
+NUMXFERS : 0
+TONBATT  : 0 Seconds
+CUMONBATT: 0 Seconds
+XOFFBATT : N/A
+SELFTEST : NO
+STATFLAG : 0x05000008
+SERIALNO : XXXXXXXXXXXX
+BATTDATE : 2021-03-03
+NOMINV   : 120 Volts
+NOMBATTV : 24.0 Volts
+NOMPOWER : 900 Watts
+FIRMWARE : 947.d10 .D USB FW:d
+END APC  : 2026-04-03 22:40:14 -0400
+```
+
+The watchdog reads the `STATUS` field. `ONLINE` means mains power; `ONBATT` triggers shutdown.
+
 ## How it works
 
 The script queries the apcupsd NIS socket directly using the native length-prefixed protocol. If `STATUS` is `ONBATT`, it calls `shutdown -h +1` to give users a 1-minute grace period before the host halts.
