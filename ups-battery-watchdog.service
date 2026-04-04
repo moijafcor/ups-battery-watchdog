@@ -1,0 +1,14 @@
+[Unit]
+Description=UPS battery watchdog
+Documentation=https://github.com/rafaelc/ups-battery-watchdog
+After=apcupsd.service network.target
+Wants=apcupsd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/ups-battery-watchdog/ups_battery_watchdog.py
+# To monitor a remote apcupsd instance, override with:
+# ExecStart=/usr/bin/python3 /opt/ups-battery-watchdog/ups_battery_watchdog.py --host 192.168.1.x
+
+[Install]
+WantedBy=multi-user.target

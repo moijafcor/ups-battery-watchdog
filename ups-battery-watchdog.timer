@@ -1,0 +1,11 @@
+[Unit]
+Description=Run UPS battery watchdog every 2 minutes
+Documentation=https://github.com/rafaelc/ups-battery-watchdog
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
