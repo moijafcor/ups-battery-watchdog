@@ -66,11 +66,12 @@ Make sure the remote host's NIS is listening on `0.0.0.0` (not `127.0.0.1`) and 
 ## CLI options
 
 ```
-usage: ups_battery_watchdog.py [-h] [--host HOST] [--port PORT] [--dry-run]
+usage: ups_battery_watchdog.py [-h] [--host HOST] [--port PORT] [--delay MINUTES] [--dry-run]
 
-  --host HOST   apcupsd NIS host (default: localhost)
-  --port PORT   apcupsd NIS port (default: 3551)
-  --dry-run     Log what would happen without executing shutdown
+  --host HOST      apcupsd NIS host (default: localhost)
+  --port PORT      apcupsd NIS port (default: 3551)
+  --delay MINUTES  minutes to wait before shutdown (default: 1)
+  --dry-run        log what would happen without executing shutdown
 ```
 
 ## Testing

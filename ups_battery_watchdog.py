@@ -4,7 +4,7 @@ UPS battery watchdog — shuts down the host if APC UPS is running on battery.
 Communicates directly with apcupsd NIS (port 3551) using the native protocol.
 
 Usage:
-    python3 ups_battery_watchdog.py [--host HOST] [--port PORT] [--dry-run]
+    python3 ups_battery_watchdog.py [--host HOST] [--port PORT] [--delay MINUTES] [--dry-run]
 
 Intended to run as a systemd service or cron job on the host with the UPS attached.
 """
@@ -18,7 +18,7 @@ import sys
 
 APCUPSD_NIS_HOST = "localhost"
 APCUPSD_NIS_PORT = 3551
-SHUTDOWN_COMMAND = ["/usr/sbin/shutdown", "-h", "+1", "UPS on battery: shutting down"]
+SHUTDOWN_DELAY_MINUTES = 1
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,18 +79,21 @@ def is_on_battery(status: dict[str, str]) -> bool:
     return status.get("STATUS", "") == "ONBATT"
 
 
-def shutdown(dry_run: bool) -> None:
+def shutdown(delay: int, dry_run: bool) -> None:
+    cmd = ["/usr/sbin/shutdown", "-h", f"+{delay}", "UPS on battery: shutting down"]
     if dry_run:
-        log.warning("DRY RUN — would execute: %s", " ".join(SHUTDOWN_COMMAND))
+        log.warning("DRY RUN — would execute: %s", " ".join(cmd))
         return
-    log.warning("UPS on battery — initiating shutdown: %s", " ".join(SHUTDOWN_COMMAND))
-    subprocess.run(SHUTDOWN_COMMAND, check=True)
+    log.warning("UPS on battery — initiating shutdown: %s", " ".join(cmd))
+    subprocess.run(cmd, check=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Shut down host when UPS is on battery.")
     parser.add_argument("--host", default=APCUPSD_NIS_HOST, help="apcupsd NIS host (default: localhost)")
     parser.add_argument("--port", type=int, default=APCUPSD_NIS_PORT, help="apcupsd NIS port (default: 3551)")
+    parser.add_argument("--delay", type=int, default=SHUTDOWN_DELAY_MINUTES,
+                        help="Minutes to wait before shutdown (default: 1)")
     parser.add_argument("--dry-run", action="store_true", help="Report action without executing shutdown")
     args = parser.parse_args()
 
@@ -108,7 +111,7 @@ def main() -> None:
     log.info("UPS status=%s load=%s battery=%s runtime=%s", ups_status, load, bcharge, timeleft)
 
     if is_on_battery(status):
-        shutdown(args.dry_run)
+        shutdown(args.delay, args.dry_run)
     else:
         log.info("UPS is not on battery — no action taken.")
 
