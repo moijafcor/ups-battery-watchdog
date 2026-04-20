@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 """
-UPS battery watchdog — shuts down the host if APC UPS is running on battery.
+UPS battery watchdog — shuts down the host if APC UPS is running on battery
+and estimated runtime falls below a configurable threshold.
 Communicates directly with apcupsd NIS (port 3551) using the native protocol.
 
 Usage:
     # Run watchdog (intended for systemd timer / cron):
-    python3 ups_battery_watchdog.py [--host HOST] [--port PORT] [--delay MINUTES] [--log-file PATH] [--dry-run]
+    python3 ups_battery_watchdog.py [--host HOST] [--port PORT] [--delay MINUTES]
+                                    [--timeleft-min MINUTES] [--sentinel PATH]
+                                    [--log-file PATH] [--dry-run]
+
 
     # Read outage history from the log:
     python3 ups_battery_watchdog.py outages [--log-file PATH]
 
 Design:
     Each invocation is stateless — it queries apcupsd NIS once, logs the result,
-    optionally triggers a shutdown, and exits. Persistent state lives only in the
-    log file, which the `outages` subcommand can parse to reconstruct outage history.
+    optionally triggers a shutdown, and exits. The only persistent state between
+    invocations is a sentinel file (default: /run/ups-battery-watchdog.shutdown)
+    written when a shutdown is scheduled and removed when it is cancelled.
+    Because /run is a tmpfs, the sentinel is always cleared on reboot.
+
+    Shutdown is triggered only when STATUS==ONBATT *and* TIMELEFT is below
+    --timeleft-min (default: 8 minutes). Short outages where the battery has
+    ample runtime are ignored. If TIMELEFT is unavailable the watchdog shuts
+    down immediately regardless of the threshold (safe default).
+
+    When STATUS returns to ONLINE and the sentinel file is present, the pending
+    shutdown is cancelled via `shutdown -c`.
 
     The NIS protocol is a simple length-prefixed request/response:
         - Client sends: 2-byte big-endian length + command bytes (e.g. b"status")
@@ -34,7 +48,9 @@ from pathlib import Path
 APCUPSD_NIS_HOST = "localhost"
 APCUPSD_NIS_PORT = 3551
 SHUTDOWN_DELAY_MINUTES = 1
+TIMELEFT_MIN_MINUTES = 8
 DEFAULT_LOG_FILE = Path("/var/log/ups-battery-watchdog.log")
+DEFAULT_SENTINEL = Path("/run/ups-battery-watchdog.shutdown")
 
 LOG_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
@@ -78,9 +94,10 @@ def read_nis_status(host: str, port: int) -> dict[str, str]:
     stripped keys to stripped values, e.g.::
 
         {
-            "STATUS":  "ONLINE",
-            "BCHARGE": "98.0 Percent",
-            "LOADPCT": "31.0 Percent",
+            "STATUS":   "ONLINE",
+            "BCHARGE":  "98.0 Percent",
+            "LOADPCT":  "31.0 Percent",
+            "TIMELEFT": "19.4 Minutes",
             ...
         }
 
@@ -138,12 +155,32 @@ def is_on_battery(status: dict[str, str]) -> bool:
     return status.get("STATUS", "") == "ONBATT"
 
 
-def shutdown(delay: int, dry_run: bool) -> None:
-    """Invoke the system shutdown command with a *delay*-minute grace period.
+def timeleft_minutes(status: dict[str, str]) -> float | None:
+    """Extract the estimated runtime from *status* and return it as a float.
+
+    apcupsd reports TIMELEFT as e.g. ``"16.4 Minutes"``. Returns ``None`` if
+    the field is absent or cannot be parsed.
+    """
+    raw = status.get("TIMELEFT", "")
+    try:
+        return float(raw.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def write_sentinel(path: Path) -> None:
+    """Create the shutdown sentinel file."""
+    path.touch()
+
+
+def shutdown(delay: int, dry_run: bool, sentinel: Path) -> None:
+    """Invoke the system shutdown command with a *delay*-minute grace period
+    and record the intent in *sentinel*.
 
     Args:
-        delay:   Minutes before the host halts. ``0`` shuts down immediately.
-        dry_run: If True, log the command that would be run without executing it.
+        delay:    Minutes before the host halts. ``0`` shuts down immediately.
+        dry_run:  If True, log the command that would be run without executing it.
+        sentinel: Path to the sentinel file written to track the pending shutdown.
 
     The shutdown message broadcast to logged-in users is:
     ``"UPS on battery: shutting down"``.
@@ -151,16 +188,45 @@ def shutdown(delay: int, dry_run: bool) -> None:
     cmd = ["/usr/sbin/shutdown", "-h", f"+{delay}", "UPS on battery: shutting down"]
     if dry_run:
         log.warning("DRY RUN — would execute: %s", " ".join(cmd))
+        write_sentinel(sentinel)
         return
     log.warning("UPS on battery — initiating shutdown: %s", " ".join(cmd))
+    write_sentinel(sentinel)
     subprocess.run(cmd, check=True)
 
 
-def cmd_watch(args: argparse.Namespace) -> None:
-    """Poll apcupsd NIS once and shut down the host if the UPS is on battery.
+def cancel_shutdown(dry_run: bool, sentinel: Path) -> None:
+    """Cancel a pending shutdown scheduled by a prior watchdog run.
 
-    Intended to be called on a schedule (systemd timer or cron). Logs UPS
-    status on every run; only triggers shutdown when ``STATUS == ONBATT``.
+    Runs ``shutdown -c``, removes *sentinel*, and logs the event. Safe to call
+    even when no shutdown is pending — the system command will simply report
+    that there is nothing to cancel.
+
+    Args:
+        dry_run:  If True, log the action without executing it.
+        sentinel: Path to the sentinel file to remove.
+    """
+    if dry_run:
+        log.warning("DRY RUN — would cancel pending shutdown and remove sentinel %s", sentinel)
+        sentinel.unlink(missing_ok=True)
+        return
+    try:
+        subprocess.run(["/usr/sbin/shutdown", "-c"], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        pass  # no pending shutdown — harmless
+    sentinel.unlink(missing_ok=True)
+    log.warning("UPS power restored — cancelled pending shutdown")
+
+
+def cmd_watch(args: argparse.Namespace) -> None:
+    """Poll apcupsd NIS once and act based on UPS status and runtime.
+
+    Behaviour:
+    - ONBATT + TIMELEFT >= timeleft_min: log a warning, skip shutdown.
+    - ONBATT + TIMELEFT < timeleft_min (or TIMELEFT unavailable): schedule
+      shutdown and write the sentinel file.
+    - ONLINE + sentinel present: cancel the pending shutdown.
+    - ONLINE + no sentinel: log normal status, no action.
 
     Exits with code 2 if apcupsd NIS is unreachable.
     """
@@ -180,18 +246,47 @@ def cmd_watch(args: argparse.Namespace) -> None:
     log.info("UPS status=%s load=%s battery=%s runtime=%s", ups_status, load, bcharge, timeleft)
 
     if is_on_battery(status):
-        shutdown(args.delay, args.dry_run)
+        tl = timeleft_minutes(status)
+        if tl is not None and tl >= args.timeleft_min:
+            log.warning(
+                "UPS on battery but runtime %.1f min >= threshold %d min"
+                " — monitoring, shutdown deferred",
+                tl, args.timeleft_min,
+            )
+        else:
+            if tl is None:
+                log.warning(
+                    "UPS on battery — TIMELEFT unavailable, triggering shutdown immediately"
+                )
+            else:
+                log.warning(
+                    "UPS on battery — runtime %.1f min below threshold %d min, triggering shutdown",
+                    tl, args.timeleft_min,
+                )
+            shutdown(args.delay, args.dry_run, args.sentinel)
     else:
-        log.info("UPS is not on battery — no action taken.")
+        if args.sentinel.exists():
+            cancel_shutdown(args.dry_run, args.sentinel)
+        else:
+            log.info("UPS is not on battery — no action taken.")
 
 
 # ── Outage reader ─────────────────────────────────────────────────────────────
 
 # Matches: 2026-04-03T10:00:01 WARNING UPS on battery — initiating shutdown...
 _SHUTDOWN_RE = re.compile(
-    r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) WARNING UPS on battery"
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) WARNING UPS on battery \u2014 initiating"
 )
-# Matches: 2026-04-03T10:00:01 INFO UPS status=ONBATT load=33.0 Percent battery=98.0 Percent runtime=2.8 Minutes
+# Matches: 2026-04-03T10:00:01 WARNING UPS power restored — cancelled pending shutdown
+_CANCEL_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) WARNING UPS power restored"
+)
+# Matches: 2026-04-03T10:00:01 WARNING UPS on battery but runtime 16.4 min >= threshold ...
+_DEFERRED_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) WARNING UPS on battery but runtime "
+    r"(?P<runtime>\S+) min >= threshold"
+)
+# Matches: INFO UPS status=ONBATT load=33.0 Percent battery=98.0 Percent runtime=2.8 Minutes
 _STATUS_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) INFO UPS "
     r"status=(?P<status>\S+)\s+"
@@ -211,24 +306,13 @@ def parse_outages(log_file: Path) -> list[dict]:
     Each event is a dict with the following keys:
 
     - ``ts``      — ISO-8601 timestamp string (``YYYY-MM-DDTHH:MM:SS``)
-    - ``kind``    — one of ``'on_battery'``, ``'shutdown'``, or ``'commlost'``
+    - ``kind``    — one of ``'on_battery'``, ``'shutdown'``, ``'cancel'``,
+                    ``'deferred'``, or ``'commlost'``
     - ``load``    — load percentage string, e.g. ``"34.0"`` (on_battery only)
     - ``battery`` — battery charge percentage string (on_battery only)
-    - ``runtime`` — estimated runtime string in minutes (on_battery only)
+    - ``runtime`` — estimated runtime string in minutes (on_battery/deferred only)
 
     Returns an empty list if *log_file* does not exist.
-
-    Three patterns are recognised:
-
-    ``on_battery``
-        An ``INFO`` line with ``status=ONBATT``, recording the load, charge,
-        and estimated runtime at the moment power was lost.
-
-    ``shutdown``
-        A ``WARNING`` line confirming the shutdown command was dispatched.
-
-    ``commlost``
-        An ``ERROR`` line indicating apcupsd NIS was unreachable.
     """
     if not log_file.exists():
         return []
@@ -237,9 +321,19 @@ def parse_outages(log_file: Path) -> list[dict]:
     with log_file.open() as fh:
         for line in fh:
             line = line.rstrip()
+            m = _DEFERRED_RE.match(line)
+            if m:
+                events.append({
+                    "ts": m.group("ts"), "kind": "deferred", "runtime": m.group("runtime"),
+                })
+                continue
             m = _SHUTDOWN_RE.match(line)
             if m:
                 events.append({"ts": m.group("ts"), "kind": "shutdown"})
+                continue
+            m = _CANCEL_RE.match(line)
+            if m:
+                events.append({"ts": m.group("ts"), "kind": "cancel"})
                 continue
             m = _STATUS_RE.match(line)
             if m and m.group("status") == "ONBATT":
@@ -269,7 +363,13 @@ def cmd_outages(args: argparse.Namespace) -> None:
     print(f"Outage events from {args.log_file}:\n")
     print(f"{'Timestamp':<22} {'Event':<12} {'Load':<12} {'Battery':<12} {'Runtime'}")
     print("-" * 78)
-    kind_labels = {"shutdown": "SHUTDOWN", "on_battery": "ON BATTERY", "commlost": "COMM LOST"}
+    kind_labels = {
+        "shutdown":   "SHUTDOWN",
+        "cancel":     "CANCELLED",
+        "deferred":   "DEFERRED",
+        "on_battery": "ON BATTERY",
+        "commlost":   "COMM LOST",
+    }
     for e in events:
         kind_label = kind_labels.get(e["kind"], e["kind"])
         load    = e.get("load", "—")
@@ -278,9 +378,14 @@ def cmd_outages(args: argparse.Namespace) -> None:
         print(f"{e['ts']:<22} {kind_label:<12} {load:<12} {battery:<12} {runtime}")
 
     shutdowns  = sum(1 for e in events if e["kind"] == "shutdown")
+    cancels    = sum(1 for e in events if e["kind"] == "cancel")
+    deferred   = sum(1 for e in events if e["kind"] == "deferred")
     on_battery = sum(1 for e in events if e["kind"] == "on_battery")
     commlost   = sum(1 for e in events if e["kind"] == "commlost")
-    print(f"\nTotal: {on_battery} on-battery event(s), {shutdowns} shutdown(s), {commlost} comm-lost event(s)")
+    print(
+        f"\nTotal: {on_battery} on-battery event(s), {shutdowns} shutdown(s), "
+        f"{cancels} cancel(s), {deferred} deferred(s), {commlost} comm-lost event(s)"
+    )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -292,13 +397,22 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Subcommands:\n  outages    Print outage history from the log file",
     )
-    parser.add_argument("--host", default=APCUPSD_NIS_HOST, help="apcupsd NIS host (default: localhost)")
-    parser.add_argument("--port", type=int, default=APCUPSD_NIS_PORT, help="apcupsd NIS port (default: 3551)")
+    parser.add_argument("--host", default=APCUPSD_NIS_HOST,
+                        help="apcupsd NIS host (default: localhost)")
+    parser.add_argument("--port", type=int, default=APCUPSD_NIS_PORT,
+                        help="apcupsd NIS port (default: 3551)")
     parser.add_argument("--delay", type=int, default=SHUTDOWN_DELAY_MINUTES,
                         help="Minutes to wait before shutdown (default: 1)")
+    parser.add_argument("--timeleft-min", type=int, default=TIMELEFT_MIN_MINUTES,
+                        help="Only shut down if TIMELEFT is below this many minutes (default: 8). "
+                             "Set to 0 to shut down on any ONBATT event regardless of runtime.")
+    parser.add_argument("--sentinel", type=Path, default=DEFAULT_SENTINEL,
+                        help=f"Sentinel file path for tracking pending shutdowns "
+                             f"(default: {DEFAULT_SENTINEL})")
     parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE,
                         help=f"Log file path (default: {DEFAULT_LOG_FILE})")
-    parser.add_argument("--dry-run", action="store_true", help="Report action without executing shutdown")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Report action without executing shutdown or cancel")
     parser.add_argument("subcommand", nargs="?", choices=["outages"],
                         help="outages: print outage history from the log file")
 

@@ -1,6 +1,8 @@
 """Unit tests for ups_battery_watchdog.py."""
 
+import logging
 import socket
+from subprocess import CalledProcessError
 import struct
 import threading
 import unittest
@@ -69,6 +71,13 @@ _SHUTDOWN_LINE = (
     "2026-04-03T22:46:00 WARNING UPS on battery — initiating shutdown: "
     "/usr/sbin/shutdown -h +1 UPS on battery: shutting down"
 )
+_CANCEL_LINE = (
+    "2026-04-03T22:48:00 WARNING UPS power restored — cancelled pending shutdown"
+)
+_DEFERRED_LINE = (
+    "2026-04-19T18:36:29 WARNING UPS on battery but runtime 16.4 min >= threshold 8 min"
+    " — monitoring, shutdown deferred"
+)
 _COMMLOST_LINE = (
     "2026-04-03T22:50:01 ERROR Cannot reach apcupsd NIS "
     "at localhost:3551 — Connection refused"
@@ -85,24 +94,40 @@ class TestIsOnBattery(unittest.TestCase):
     """Tests for the is_on_battery status check."""
 
     def test_onbatt_returns_true(self):
-        """STATUS=ONBATT should trigger a shutdown."""
         self.assertTrue(w.is_on_battery({"STATUS": "ONBATT"}))
 
     def test_online_returns_false(self):
-        """STATUS=ONLINE is normal mains operation."""
         self.assertFalse(w.is_on_battery({"STATUS": "ONLINE"}))
 
     def test_commlost_returns_false(self):
-        """COMMLOST means apcupsd lost contact with the UPS; not actionable here."""
         self.assertFalse(w.is_on_battery({"STATUS": "COMMLOST"}))
 
     def test_missing_key_returns_false(self):
-        """An empty status dict should not trigger shutdown."""
         self.assertFalse(w.is_on_battery({}))
 
     def test_case_sensitive(self):
-        """apcupsd always uppercases STATUS; lowercase must not match."""
         self.assertFalse(w.is_on_battery({"STATUS": "onbatt"}))
+
+
+# ── timeleft_minutes ──────────────────────────────────────────────────────────
+
+class TestTimeleftMinutes(unittest.TestCase):
+    """Tests for TIMELEFT parsing."""
+
+    def test_parses_standard_format(self):
+        self.assertAlmostEqual(w.timeleft_minutes({"TIMELEFT": "16.4 Minutes"}), 16.4)
+
+    def test_parses_integer_value(self):
+        self.assertAlmostEqual(w.timeleft_minutes({"TIMELEFT": "5 Minutes"}), 5.0)
+
+    def test_returns_none_when_missing(self):
+        self.assertIsNone(w.timeleft_minutes({}))
+
+    def test_returns_none_when_unparseable(self):
+        self.assertIsNone(w.timeleft_minutes({"TIMELEFT": "unknown"}))
+
+    def test_returns_none_for_empty_string(self):
+        self.assertIsNone(w.timeleft_minutes({"TIMELEFT": ""}))
 
 
 # ── shutdown ──────────────────────────────────────────────────────────────────
@@ -110,34 +135,87 @@ class TestIsOnBattery(unittest.TestCase):
 class TestShutdown(unittest.TestCase):
     """Tests for the shutdown command builder."""
 
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.sentinel = Path(self.tmp.name) / "sentinel"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
     @patch("ups_battery_watchdog.subprocess.run")
     def test_dry_run_does_not_call_subprocess(self, mock_run):
-        """--dry-run must never invoke the real shutdown binary."""
-        w.shutdown(delay=1, dry_run=True)
+        w.shutdown(delay=1, dry_run=True, sentinel=self.sentinel)
         mock_run.assert_not_called()
 
     @patch("ups_battery_watchdog.subprocess.run")
+    def test_dry_run_writes_sentinel(self, mock_run):
+        w.shutdown(delay=1, dry_run=True, sentinel=self.sentinel)
+        self.assertTrue(self.sentinel.exists())
+
+    @patch("ups_battery_watchdog.subprocess.run")
     def test_calls_shutdown_with_correct_delay(self, mock_run):
-        """shutdown -h +N must use the delay value passed in."""
-        w.shutdown(delay=3, dry_run=False)
+        w.shutdown(delay=3, dry_run=False, sentinel=self.sentinel)
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
         self.assertIn("+3", cmd)
         self.assertEqual(cmd[0], "/usr/sbin/shutdown")
 
     @patch("ups_battery_watchdog.subprocess.run")
+    def test_writes_sentinel_on_real_shutdown(self, mock_run):
+        w.shutdown(delay=3, dry_run=False, sentinel=self.sentinel)
+        self.assertTrue(self.sentinel.exists())
+
+    @patch("ups_battery_watchdog.subprocess.run")
     def test_zero_delay(self, mock_run):
-        """delay=0 should pass +0 to shutdown for an immediate halt."""
-        w.shutdown(delay=0, dry_run=False)
+        w.shutdown(delay=0, dry_run=False, sentinel=self.sentinel)
         cmd = mock_run.call_args[0][0]
         self.assertIn("+0", cmd)
 
     @patch("ups_battery_watchdog.subprocess.run")
     def test_shutdown_message_in_command(self, mock_run):
-        """The broadcast message must be present in the shutdown command."""
-        w.shutdown(delay=1, dry_run=False)
+        w.shutdown(delay=1, dry_run=False, sentinel=self.sentinel)
         cmd = mock_run.call_args[0][0]
         self.assertIn("UPS on battery: shutting down", cmd)
+
+
+# ── cancel_shutdown ───────────────────────────────────────────────────────────
+
+class TestCancelShutdown(unittest.TestCase):
+    """Tests for the shutdown cancellation helper."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.sentinel = Path(self.tmp.name) / "sentinel"
+        self.sentinel.touch()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @patch("ups_battery_watchdog.subprocess.run")
+    def test_removes_sentinel(self, mock_run):
+        w.cancel_shutdown(dry_run=False, sentinel=self.sentinel)
+        self.assertFalse(self.sentinel.exists())
+
+    @patch("ups_battery_watchdog.subprocess.run")
+    def test_dry_run_removes_sentinel_without_subprocess(self, mock_run):
+        w.cancel_shutdown(dry_run=True, sentinel=self.sentinel)
+        mock_run.assert_not_called()
+        self.assertFalse(self.sentinel.exists())
+
+    @patch("ups_battery_watchdog.subprocess.run")
+    def test_calls_shutdown_cancel(self, mock_run):
+        w.cancel_shutdown(dry_run=False, sentinel=self.sentinel)
+        cmd = mock_run.call_args[0][0]
+        self.assertIn("-c", cmd)
+        self.assertEqual(cmd[0], "/usr/sbin/shutdown")
+
+    @patch("ups_battery_watchdog.subprocess.run",
+           side_effect=CalledProcessError(1, "shutdown"))
+    def test_tolerates_no_pending_shutdown(self, mock_run):
+        try:
+            w.cancel_shutdown(dry_run=False, sentinel=self.sentinel)
+        except Exception:
+            self.fail("cancel_shutdown raised unexpectedly when no shutdown was pending")
 
 
 # ── read_nis_status ───────────────────────────────────────────────────────────
@@ -146,7 +224,6 @@ class TestReadNisStatus(unittest.TestCase):
     """Tests for the apcupsd NIS socket reader."""
 
     def test_parses_standard_response(self):
-        """All key/value pairs in a standard ONLINE response should be parsed."""
         records = [
             "STATUS   : ONLINE",
             "LOADPCT  : 31.0 Percent",
@@ -154,7 +231,7 @@ class TestReadNisStatus(unittest.TestCase):
             "TIMELEFT : 2.9 Minutes",
         ]
         port, t = _run_fake_nis_server(records)
-        t.join(timeout=0)  # server is already waiting
+        t.join(timeout=0)
         result = w.read_nis_status("127.0.0.1", port)
         t.join(timeout=2)
 
@@ -164,20 +241,17 @@ class TestReadNisStatus(unittest.TestCase):
         self.assertEqual(result["TIMELEFT"], "2.9 Minutes")
 
     def test_parses_onbatt_response(self):
-        """STATUS=ONBATT should be parsed correctly."""
         records = ["STATUS   : ONBATT", "BCHARGE  : 72.0 Percent"]
         port, _ = _run_fake_nis_server(records)
         result = w.read_nis_status("127.0.0.1", port)
         self.assertEqual(result["STATUS"], "ONBATT")
 
     def test_empty_response_returns_empty_dict(self):
-        """A server that sends only the terminator should yield an empty dict."""
         port, _ = _run_fake_nis_server([])
         result = w.read_nis_status("127.0.0.1", port)
         self.assertEqual(result, {})
 
     def test_lines_without_colon_are_ignored(self):
-        """Records with no colon delimiter must not appear in the output."""
         records = ["HEADER LINE", "STATUS   : ONLINE"]
         port, _ = _run_fake_nis_server(records)
         result = w.read_nis_status("127.0.0.1", port)
@@ -185,12 +259,10 @@ class TestReadNisStatus(unittest.TestCase):
         self.assertNotIn("HEADER LINE", result)
 
     def test_raises_on_connection_refused(self):
-        """OSError must propagate when NIS is unreachable."""
         with self.assertRaises(OSError):
-            w.read_nis_status("127.0.0.1", 1)  # port 1 is never listening
+            w.read_nis_status("127.0.0.1", 1)
 
     def test_value_with_colon_is_preserved(self):
-        """Only the first colon is the key/value delimiter; timestamps must be intact."""
         records = ["DATE     : 2026-04-03 22:40:11 -0400"]
         port, _ = _run_fake_nis_server(records)
         result = w.read_nis_status("127.0.0.1", port)
@@ -203,12 +275,10 @@ class TestParseOutages(unittest.TestCase):
     """Tests for the log file outage parser."""
 
     def test_returns_empty_list_for_missing_file(self):
-        """A non-existent log file should return an empty list, not raise."""
         result = w.parse_outages(Path("/nonexistent/path/ups.log"))
         self.assertEqual(result, [])
 
     def test_detects_on_battery_event(self):
-        """An ONBATT status line should produce an on_battery event with metrics."""
         log = _write_log([_ONBATT_LINE])
         events = w.parse_outages(log)
         self.assertEqual(len(events), 1)
@@ -219,22 +289,33 @@ class TestParseOutages(unittest.TestCase):
         self.assertEqual(events[0]["runtime"], "2.6")
 
     def test_detects_shutdown_event(self):
-        """A WARNING shutdown line should produce a shutdown event."""
         log = _write_log([_SHUTDOWN_LINE])
         events = w.parse_outages(log)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["kind"], "shutdown")
         self.assertEqual(events[0]["ts"], "2026-04-03T22:46:00")
 
+    def test_detects_cancel_event(self):
+        log = _write_log([_CANCEL_LINE])
+        events = w.parse_outages(log)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "cancel")
+        self.assertEqual(events[0]["ts"], "2026-04-03T22:48:00")
+
+    def test_detects_deferred_event(self):
+        log = _write_log([_DEFERRED_LINE])
+        events = w.parse_outages(log)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "deferred")
+        self.assertEqual(events[0]["runtime"], "16.4")
+
     def test_detects_commlost_event(self):
-        """An ERROR NIS-unreachable line should produce a commlost event."""
         log = _write_log([_COMMLOST_LINE])
         events = w.parse_outages(log)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["kind"], "commlost")
 
     def test_online_status_lines_are_ignored(self):
-        """Routine ONLINE poll lines must not appear as outage events."""
         log = _write_log([
             _ONLINE_LINE,
             "2026-04-03T22:45:00 INFO UPS is not on battery — no action taken.",
@@ -242,8 +323,15 @@ class TestParseOutages(unittest.TestCase):
         events = w.parse_outages(log)
         self.assertEqual(events, [])
 
-    def test_full_outage_sequence(self):
-        """A complete outage cycle should yield three events in order."""
+    def test_full_outage_with_cancel(self):
+        """Short outage: on-battery → deferred → power restored → cancelled."""
+        log = _write_log([_ONLINE_LINE, _ONBATT_LINE, _DEFERRED_LINE, _CANCEL_LINE])
+        events = w.parse_outages(log)
+        kinds = [e["kind"] for e in events]
+        self.assertEqual(kinds, ["on_battery", "deferred", "cancel"])
+
+    def test_full_outage_with_shutdown(self):
+        """Long outage: on-battery → shutdown triggered."""
         log = _write_log([_ONLINE_LINE, _ONBATT_LINE, _SHUTDOWN_LINE, _COMMLOST_LINE])
         events = w.parse_outages(log)
         self.assertEqual(len(events), 3)
@@ -252,7 +340,6 @@ class TestParseOutages(unittest.TestCase):
         self.assertEqual(events[2]["kind"], "commlost")
 
     def test_multiple_outages_over_time(self):
-        """Multiple outage cycles across different days should all be captured."""
         onbatt_1 = (
             "2026-04-01T10:00:00 INFO UPS "
             "status=ONBATT load=30.0 Percent battery=95.0 Percent runtime=3.0 Minutes"
@@ -277,7 +364,6 @@ class TestParseOutages(unittest.TestCase):
         self.assertEqual(len(shutdowns), 2)
 
     def test_dry_run_line_not_parsed_as_shutdown(self):
-        """DRY RUN lines do not start with 'WARNING UPS on battery' and must be ignored."""
         log = _write_log([_DRY_RUN_LINE])
         events = w.parse_outages(log)
         self.assertEqual(events, [])
@@ -289,29 +375,24 @@ class TestSetupLogging(unittest.TestCase):
     """Tests for the logging setup helper."""
 
     def setUp(self):
-        """Reset root logger handlers between tests, closing any open file handles."""
-        import logging as _logging
-        root = _logging.getLogger()
+        root = logging.getLogger()
         for h in root.handlers[:]:
             h.close()
         root.handlers.clear()
 
     def test_creates_log_file(self):
-        """setup_logging should create the log file if it does not exist."""
         with TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "test.log"
             w.setup_logging(log_path)
             self.assertTrue(log_path.exists())
 
     def test_creates_parent_directory(self):
-        """setup_logging should create missing parent directories."""
         with TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "subdir" / "test.log"
             w.setup_logging(log_path)
             self.assertTrue(log_path.exists())
 
     def test_falls_back_gracefully_on_unwritable_path(self):
-        """setup_logging must not raise when the log path is unwritable."""
         try:
             w.setup_logging(Path("/proc/nonexistent/ups.log"))
         except OSError as exc:
